@@ -15,6 +15,7 @@ import (
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/types"
 	clientfake "k8s.io/client-go/kubernetes/fake"
 	clienttesting "k8s.io/client-go/testing"
 	crclient "sigs.k8s.io/controller-runtime/pkg/client"
@@ -301,6 +302,115 @@ func TestPlanningCommitsSnapshotWithoutChangingIntent(t *testing.T) {
 
 	if calls != 1 {
 		t.Fatalf("discovery ran %d times", calls)
+	}
+}
+
+func TestMigrationPlanningFreezesOnlyRequestedPVCs(t *testing.T) {
+	scheme := runtime.NewScheme()
+	if err := v1alpha1.AddToScheme(scheme); err != nil {
+		t.Fatal(err)
+	}
+
+	object := &v1alpha1.Migration{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:       "selected",
+			Namespace:  "system",
+			UID:        "workflow-uid",
+			Generation: 1,
+		},
+		Spec: v1alpha1.MigrationSpec{Volumes: []v1alpha1.VolumeRequest{
+			{SourcePVC: v1alpha1.LocalResourceReference{Name: "logs"}},
+			{SourcePVC: v1alpha1.LocalResourceReference{Name: "data"}},
+		}},
+	}
+	client := crfake.NewClientBuilder().
+		WithScheme(scheme).
+		WithStatusSubresource(object).
+		WithObjects(object).
+		Build()
+	kc := clientfake.NewClientset(
+		&corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: "system"}},
+		&coordinationv1.Lease{ObjectMeta: metav1.ObjectMeta{
+			Name:            kube.SessionLockName(object.Name),
+			Namespace:       object.Namespace,
+			UID:             "lease-uid",
+			ResourceVersion: "1",
+			Labels: map[string]string{
+				kube.ManagedByLabel: kube.ManagedByValue,
+				kube.SessionKey:     object.Name,
+			},
+		}},
+	)
+	store := kube.NewCRDSessionStore(client).WithLeaseClient(kc)
+	r := NewWorkflowReconciler(&recordingWorkflowResumer{}, store).
+		WithKubernetesClient(kc).
+		WithTrustedToolImage("example/tool:v1").
+		WithPlanner(func(_ context.Context, session *domain.Session, image string) (domain.SessionSpec, error) {
+			if got := []string{
+				session.Spec.Volumes[0].SourcePVC.Name,
+				session.Spec.Volumes[1].SourcePVC.Name,
+			}; !reflect.DeepEqual(got, []string{"logs", "data"}) {
+				t.Fatalf("planner request PVCs=%v", got)
+			}
+
+			volumes := make([]domain.VolumeSpec, 0, len(session.Spec.Volumes))
+			for _, request := range session.Spec.Volumes {
+				name := request.SourcePVC.Name
+				volumes = append(volumes, domain.VolumeSpec{
+					SourcePVC: domain.ObjectReference{
+						APIVersion: "v1", Kind: "PersistentVolumeClaim",
+						Namespace: "system", Name: name, UID: types.UID(name + "-pvc-uid"),
+					},
+					SourcePV: domain.ObjectReference{
+						APIVersion: "v1", Kind: "PersistentVolume",
+						Name: "pv-" + name, UID: types.UID(name + "-pv-uid"),
+					},
+					SourceReclaimPolicy: corev1.PersistentVolumeReclaimDelete,
+					DestinationPVC: domain.ObjectReference{
+						APIVersion: "v1", Kind: "PersistentVolumeClaim",
+						Namespace: "system", Name: name + "-migrated",
+					},
+					Capacity:       "2Gi",
+					SourceCapacity: "2Gi",
+					StorageClass:   "fast",
+					AccessModes:    []corev1.PersistentVolumeAccessMode{corev1.ReadWriteOnce},
+					VolumeMode:     corev1.PersistentVolumeFilesystem,
+				})
+			}
+
+			return domain.NewOfflineMigrationSessionSpec(domain.SessionCommon{
+				SourceNamespace:      "system",
+				TemporaryNamespace:   "system",
+				DestinationNamespace: "system",
+				SessionNamespace:     "system",
+				Volumes:              volumes,
+			}, domain.SessionWorkflowOptions{ToolImage: image}), nil
+		})
+
+	before := object.Spec.DeepCopy()
+	request := reconcile.Request{NamespacedName: crclient.ObjectKeyFromObject(object)}
+	if _, err := r.reconcile(t.Context(), request, domain.ControllerKindMigration); err != nil {
+		t.Fatal(err)
+	}
+
+	after := &v1alpha1.Migration{}
+	if err := client.Get(t.Context(), request.NamespacedName, after); err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(*before, after.Spec) {
+		t.Fatalf("planning changed intent: before=%+v after=%+v", *before, after.Spec)
+	}
+	if after.Status.Plan == nil || len(after.Status.Plan.Volumes) != 2 {
+		t.Fatalf("planned volumes=%+v", after.Status.Plan)
+	}
+
+	for index, name := range []string{"logs", "data"} {
+		volume := after.Status.Plan.Volumes[index]
+		if volume.SourcePVC.Name != name || volume.SourcePVC.UID != types.UID(name+"-pvc-uid") ||
+			volume.SourcePV.Name != "pv-"+name || volume.SourcePV.UID != types.UID(name+"-pv-uid") ||
+			volume.DestinationPVC.Name != name+"-migrated" {
+			t.Fatalf("plan volume %d=%+v", index, volume)
+		}
 	}
 }
 

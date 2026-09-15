@@ -249,7 +249,7 @@ func NewRoot(options Options) *cobra.Command {
 
 func bindDryRun(command *cobra.Command, target *bool) {
 	command.Flags().
-		BoolVar(target, "dry-run", true, "Validate and print the plan without mutations; use --dry-run=false to execute")
+		BoolVar(target, "dry-run", true, "Validate and print the plan without persistent workflow or data-plane mutations; use --dry-run=false to execute")
 }
 
 func (r *rootState) runtime() (*commandRuntime, error) {
@@ -337,6 +337,7 @@ func (r *rootState) runtime() (*commandRuntime, error) {
 		clients.Kubernetes,
 		clients.Dynamic,
 	)
+	hostPathUsageReader := kube.NewHostPathUsageReader(clients.Kubernetes, r.global.toolImage)
 
 	controllerMode := requestedMode == executionModeController
 	streamToolLogs := r.global.streamToolLogs && !controllerMode
@@ -380,8 +381,10 @@ func (r *rootState) runtime() (*commandRuntime, error) {
 			Logger:                        serviceLogger,
 			ToolImageProber:               kube.NewToolImageProber(clients.Kubernetes),
 			TrustedToolImage:              trustedToolImage,
+			HostPathUsageReader:           hostPathUsageReader,
 			OpenEBSLVMSharedVolumeManager: openEBSLVMSharedVolumeManager,
-			SessionRecords:                sessionRecords,
+
+			SessionRecords: sessionRecords,
 		},
 	)
 
@@ -392,7 +395,9 @@ func (r *rootState) runtime() (*commandRuntime, error) {
 			WithSessionRecords(sessionRecords).
 			WithControllerSubmission(controllerMode).
 			WithOpenEBSLVMSharedVolumeManager(openEBSLVMSharedVolumeManager).
+			WithHostPathUsageReader(hostPathUsageReader).
 			WithLogger(logger.With("component", "planner")),
+
 		service: service,
 		printer: output.Printer{Writer: r.options.Out, Format: format},
 		logger:  logger.With("component", "backup"),

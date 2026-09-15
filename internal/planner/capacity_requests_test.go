@@ -75,6 +75,79 @@ func (p staticUsageReader) Read(
 	return kube.VolumeUsageReadResult{UsedBytes: p.bytes, Source: "test storage CRD"}, nil
 }
 
+func TestHostPathDestinationCapacityAddsTwentyPercentAndRoundsMiB(t *testing.T) {
+	cases := []struct {
+		name string
+		used int64
+		want string
+	}{
+		{name: "below source capacity", used: 1, want: "2Gi"},
+		{name: "above source capacity", used: 3 << 30, want: "3866099712"},
+		{name: "rounds up", used: (2 << 30) + 1, want: "2577399808"},
+	}
+	for _, test := range cases {
+		t.Run(test.name, func(t *testing.T) {
+			got := kube.HostPathDestinationCapacity(resource.MustParse("2Gi"), test.used)
+			if got.String() != test.want {
+				t.Fatalf("capacity=%s want=%s", got.String(), test.want)
+			}
+		})
+	}
+}
+
+func TestPlanAutoSizesHostPathDestinationFromMeasuredUsage(t *testing.T) {
+	objects := plannerObjects("64Mi")
+	for _, object := range objects {
+		if sc, ok := object.(*storagev1.StorageClass); ok && sc.Name == "fast" {
+			sc.Provisioner = kube.OpenEBSLocalPVProvisioner
+			sc.Parameters = map[string]string{"storageType": "hostpath"}
+		}
+	}
+	used := int64(80 << 20)
+	plan, err := New(plannerClient(objects...), nil).
+		WithHostPathUsageReader(staticUsageReader{bytes: used}).
+		plan(context.Background(), planOptions{
+			SessionID: "hostpath-auto", Operation: domain.OperationMigrate,
+			SourceNamespace: "app", TemporaryNamespace: "system", DestinationNamespace: "app",
+			StagingNamespace: "system", SessionNamespace: "system", SourcePVCs: []string{"data"},
+			TargetNode: "node-b", DestinationClass: "fast",
+		})
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantCapacity := kube.HostPathDestinationCapacity(resource.MustParse("64Mi"), used)
+	want := wantCapacity.String()
+	if !plan.Ready || plan.SessionSpec.Volumes[0].Capacity != want ||
+		!plan.SessionSpec.Volumes[0].SourceUsageKnown ||
+		plan.SessionSpec.Volumes[0].SourceUsedBytes != used {
+		t.Fatalf("HostPath plan=%#v", plan)
+	}
+}
+
+func TestPlanRejectsExplicitHostPathCapacityBelowSafetyMinimum(t *testing.T) {
+	objects := plannerObjects("64Mi")
+	for _, object := range objects {
+		if sc, ok := object.(*storagev1.StorageClass); ok && sc.Name == "fast" {
+			sc.Provisioner = kube.OpenEBSLocalPVProvisioner
+			sc.Parameters = map[string]string{"storageType": "hostpath"}
+		}
+	}
+	plan, err := New(plannerClient(objects...), nil).
+		WithHostPathUsageReader(staticUsageReader{bytes: 80 << 20}).
+		plan(context.Background(), planOptions{
+			SessionID: "hostpath-small", Operation: domain.OperationMigrate,
+			SourceNamespace: "app", TemporaryNamespace: "system", DestinationNamespace: "app",
+			StagingNamespace: "system", SessionNamespace: "system", SourcePVCs: []string{"data"},
+			TargetNode: "node-b", DestinationClass: "fast", DestinationCapacities: []string{"90Mi"},
+		})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if plan.Ready || !hasFailedCheckContaining(plan, domain.CheckNameDestinationCapacity, "HostPath safety minimum") {
+		t.Fatalf("unsafe HostPath plan=%#v", plan)
+	}
+}
+
 func TestPlanUsesRequestedDestinationCapacity(t *testing.T) {
 	plan := planWithDestinationCapacity(t, []string{"3Gi"}, false)
 	if !plan.Ready {

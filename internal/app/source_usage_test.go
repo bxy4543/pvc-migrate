@@ -56,6 +56,25 @@ func shrinkUsageSession(skip bool) *domain.Session {
 	}
 }
 
+func TestVerifyHostPathUsageRejectsGrowthBeyondHeadroom(t *testing.T) {
+	session := shrinkUsageSession(false)
+	session.Spec.Volumes[0].SourceCapacity = "64Mi"
+	session.Spec.Volumes[0].Capacity = "96Mi"
+	session.Spec.Volumes[0].SourceUsageKnown = true
+	reader := &staticVolumeUsageReader{
+		result: kube.VolumeUsageReadResult{UsedBytes: 90 << 20, Source: "HostPath usage Pod"},
+	}
+	service := &Service{config: Config{HostPathUsageReader: reader}}
+
+	err := service.verifyShrinkUsage(context.Background(), session)
+	if err == nil || !strings.Contains(err.Error(), "HostPath safety minimum") {
+		t.Fatalf("error=%v", err)
+	}
+	if reader.calls != 1 {
+		t.Fatalf("reader calls=%d", reader.calls)
+	}
+}
+
 func TestVerifyShrinkUsageRequiresTrustedBackendReader(t *testing.T) {
 	err := (&Service{}).verifyShrinkUsage(context.Background(), shrinkUsageSession(false))
 	if err == nil || !strings.Contains(err.Error(), "--skip-source-usage-check") {

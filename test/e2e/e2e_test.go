@@ -2460,7 +2460,6 @@ func TestDeploymentWFFCMigrationAndRollback(t *testing.T) {
 		"RolledBack",
 	)
 
-	setRollbackPVsToDelete(t, ctx, client, sessionID)
 	runCLI(
 		t,
 		ctx,
@@ -2471,7 +2470,8 @@ func TestDeploymentWFFCMigrationAndRollback(t *testing.T) {
 			"migrate-pod",
 			"cleanup",
 			sessionID,
-			"--delete-rollback-pv",
+			"--destination-pvc-reclaim-policy",
+			"Delete",
 			"--finalize",
 			"--delete-session",
 			"--dry-run=false",
@@ -2743,7 +2743,6 @@ func TestStandaloneWFFCMigrationAndRollback(t *testing.T) {
 		t, ctx, config, client, mode, "podmigrations", namespace, sessionID, "RolledBack",
 	)
 
-	setRollbackPVsToDelete(t, ctx, client, sessionID)
 	runCLI(
 		t,
 		ctx,
@@ -2754,7 +2753,8 @@ func TestStandaloneWFFCMigrationAndRollback(t *testing.T) {
 			"migrate-pod",
 			"cleanup",
 			sessionID,
-			"--delete-rollback-pv",
+			"--destination-pvc-reclaim-policy",
+			"Delete",
 			"--finalize",
 			"--delete-session",
 			"--dry-run=false",
@@ -3008,7 +3008,6 @@ func TestOfflineMigrationAndRollback(t *testing.T) {
 	}
 	deletePod(t, ctx, client, namespace, readerName)
 
-	setRollbackPVsToDelete(t, ctx, client, sessionID)
 	runCLI(
 		t,
 		ctx,
@@ -3017,12 +3016,284 @@ func TestOfflineMigrationAndRollback(t *testing.T) {
 			append([]string{}, common...),
 			[]string{
 				"--yes", "migrate", "cleanup", sessionID,
-				"--delete-rollback-pv", "--finalize", "--delete-session", "--dry-run=false",
+				"--destination-pvc-reclaim-policy", "Delete",
+				"--finalize", "--delete-session", "--dry-run=false",
 			}...,
 		)...,
 	)
 	assertSessionRecordNotFound(
 		t, ctx, config, client, mode, "migrations", namespace, sessionID,
+	)
+}
+
+func TestOfflineMigrationSelectsOnlyRequestedPVCs(t *testing.T) {
+	if os.Getenv("PVC_MIGRATE_E2E") != "1" {
+		t.Skip("set PVC_MIGRATE_E2E=1 to run cluster E2E tests")
+	}
+	kubeconfig := os.Getenv("PVC_MIGRATE_E2E_KUBECONFIG")
+	if kubeconfig == "" {
+		kubeconfig = os.Getenv("KUBECONFIG")
+	}
+	if kubeconfig == "" {
+		t.Fatal("PVC_MIGRATE_E2E_KUBECONFIG or KUBECONFIG is required")
+	}
+	mode := e2eMode(t)
+	config, err := clientcmd.BuildConfigFromFlags("", kubeconfig)
+	if err != nil {
+		t.Fatal(err)
+	}
+	config.UserAgent = "pvc-migrate-e2e-selected-pvcs"
+	client, err := kubernetes.NewForConfig(config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Minute)
+	defer cancel()
+	suffix := strconv.FormatInt(time.Now().UTC().UnixNano(), 36)
+	if len(suffix) > 10 {
+		suffix = suffix[len(suffix)-10:]
+	}
+	namespace := "pvc-migrate-selected-" + suffix
+	sessionID := "selected-" + suffix
+	defer cleanupTestResources(t, config, client, namespace, sessionID)
+
+	createE2ENamespace(t, ctx, client, namespace, sessionID)
+	sourceClass := envOrDefault("PVC_MIGRATE_E2E_SOURCE_CLASS", "openebs-hostpath")
+	destinationClass := envOrDefault("PVC_MIGRATE_E2E_DESTINATION_CLASS", "openebs-backup")
+	selectedClaims := []string{"data", "logs"}
+	allClaims := append(append([]string{}, selectedClaims...), "cache")
+	for _, claim := range allClaims {
+		if _, err := client.CoreV1().PersistentVolumeClaims(namespace).Create(
+			ctx,
+			&corev1.PersistentVolumeClaim{
+				ObjectMeta: metav1.ObjectMeta{Name: claim, Namespace: namespace},
+				Spec: corev1.PersistentVolumeClaimSpec{
+					AccessModes:      []corev1.PersistentVolumeAccessMode{corev1.ReadWriteOnce},
+					StorageClassName: &sourceClass,
+					Resources: corev1.VolumeResourceRequirements{Requests: corev1.ResourceList{
+						corev1.ResourceStorage: resource.MustParse("64Mi"),
+					}},
+				},
+			},
+			metav1.CreateOptions{},
+		); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	initializerName := "initializer"
+	mounts := make([]corev1.VolumeMount, 0, len(allClaims))
+	volumes := make([]corev1.Volume, 0, len(allClaims))
+	for _, claim := range allClaims {
+		mounts = append(mounts, corev1.VolumeMount{Name: claim, MountPath: "/" + claim})
+		volumes = append(volumes, corev1.Volume{
+			Name: claim,
+			VolumeSource: corev1.VolumeSource{
+				PersistentVolumeClaim: &corev1.PersistentVolumeClaimVolumeSource{
+					ClaimName: claim,
+				},
+			},
+		})
+	}
+	if _, err := client.CoreV1().Pods(namespace).Create(ctx, &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{Name: initializerName, Namespace: namespace},
+		Spec: corev1.PodSpec{
+			RestartPolicy: corev1.RestartPolicyAlways,
+			Containers: []corev1.Container{{
+				Name:  "writer",
+				Image: envOrDefault("PVC_MIGRATE_E2E_HELPER_IMAGE", "busybox:1.36.1"),
+				Command: []string{
+					"sh",
+					"-c",
+					"set -eu; for claim in data logs; do printf '%s-%s\\n' \"$1\" \"$claim\" > \"/$claim/payload\"; dd if=/dev/zero bs=1048576 count=80 >> \"/$claim/payload\" 2>/dev/null; touch \"/$claim/ready\"; done; printf '%s-cache\\n' \"$1\" > /cache/payload; dd if=/dev/zero bs=1048576 count=2 >> /cache/payload 2>/dev/null; touch /cache/ready; sync; exec sleep 86400",
+					"initializer",
+					"selected-" + suffix,
+				},
+				ReadinessProbe: &corev1.Probe{
+					ProbeHandler: corev1.ProbeHandler{Exec: &corev1.ExecAction{
+						Command: []string{"sh", "-c", "test -f /data/ready && test -f /logs/ready && test -f /cache/ready"},
+					}},
+					PeriodSeconds: 1,
+				},
+				VolumeMounts: mounts,
+			}},
+			Volumes: volumes,
+		},
+	}, metav1.CreateOptions{}); err != nil {
+		t.Fatal(err)
+	}
+
+	initializer := waitForReadyPod(t, ctx, client, namespace, initializerName, "")
+	sourceNode := initializer.Spec.NodeName
+	sourceDigests := make(map[string]string, len(allClaims))
+	sourcePVs := make(map[string]string, len(allClaims))
+	sourceUIDs := make(map[string]types.UID, len(allClaims))
+	for _, claim := range allClaims {
+		sourceDigests[claim] = fileDigest(
+			t, ctx, config, client, namespace, initializerName, "writer", "/"+claim+"/payload",
+		)
+		pvc := waitForBoundPVC(t, ctx, client, namespace, claim)
+		sourcePVs[claim] = pvc.Spec.VolumeName
+		sourceUIDs[claim] = pvc.UID
+	}
+	deletePod(t, ctx, client, namespace, initializerName)
+
+	targetNode := os.Getenv("PVC_MIGRATE_E2E_TARGET_NODE")
+	if targetNode == "" {
+		targetNode = sourceNode
+	}
+	binary := e2eBinary(t, ctx)
+	common := []string{
+		"--kubeconfig", kubeconfig,
+		"--mode", mode,
+		"--session-namespace", namespace,
+		"--timeout", "15m",
+		"--output", "json",
+	}
+	common = appendE2EToolImage(common)
+	controllerProcess := startE2EController(
+		t, ctx, client, binary, kubeconfig, namespace, mode,
+	)
+	defer controllerProcess.Stop(t)
+	migration := []string{
+		"migrate",
+		"--session", sessionID,
+		"--source-namespace", namespace,
+		"--temporary-namespace", namespace,
+		"--source-pvc", selectedClaims[0],
+		"--source-pvc", selectedClaims[1],
+		"--destination-pvc", selectedClaims[0] + "=data-migrated",
+		"--destination-pvc", selectedClaims[1] + "=logs-migrated",
+		"--source-node", sourceNode,
+		"--target-node", targetNode,
+		"--destination-storage-class", destinationClass,
+		"--strategy", "clusterip",
+	}
+	runCLI(
+		t,
+		ctx,
+		binary,
+		append(
+			append([]string{}, common...),
+			append(append([]string{}, migration...), "--dry-run")...,
+		)...,
+	)
+	assertSessionRecordNotFound(
+		t, ctx, config, client, mode, "migrations", namespace, sessionID,
+	)
+	runCLI(
+		t,
+		ctx,
+		binary,
+		append(
+			append([]string{}, common...),
+			append(append([]string{"--yes"}, migration...), "--dry-run=false")...,
+		)...,
+	)
+	waitForSessionPhase(
+		t, ctx, config, client, mode, "migrations", namespace, sessionID, "Completed",
+	)
+	controllerProcess.Stop(t)
+
+	session := readCopySession(
+		t, ctx, config, client, mode, "migrations", namespace, sessionID,
+	)
+	if len(session.Spec.Volumes) != len(selectedClaims) {
+		t.Fatalf("migration planned %d volumes, want %d", len(session.Spec.Volumes), len(selectedClaims))
+	}
+	for index, claim := range selectedClaims {
+		if session.Spec.Volumes[index].SourcePVC.Name != claim {
+			t.Fatalf("migration volume %d source=%q want=%q", index, session.Spec.Volumes[index].SourcePVC.Name, claim)
+		}
+		capacity, err := resource.ParseQuantity(session.Spec.Volumes[index].Capacity)
+		if err != nil {
+			t.Fatal(err)
+		}
+		minimum := resource.MustParse("96Mi")
+		if !session.Spec.Volumes[index].SourceUsageKnown ||
+			session.Spec.Volumes[index].SourceUsedBytes < 80<<20 || capacity.Cmp(minimum) < 0 {
+			t.Fatalf("HostPath volume %s was not safely sized: %+v", claim, session.Spec.Volumes[index])
+		}
+	}
+	assertControllerMigrationPlanPVCs(
+		t, ctx, config, mode, namespace, sessionID, selectedClaims,
+	)
+
+	for _, claim := range selectedClaims {
+		pvc := waitForBoundPVC(t, ctx, client, namespace, claim)
+		if pvc.Spec.VolumeName == sourcePVs[claim] {
+			t.Fatalf("selected PVC %s retained source PV %s", claim, sourcePVs[claim])
+		}
+	}
+	assertPVCIdentity(t, ctx, client, namespace, "cache", sourceUIDs["cache"], sourcePVs["cache"])
+
+	selectedReader := "selected-reader"
+	createPVCReader(t, ctx, client, namespace, selectedReader, targetNode, selectedClaims)
+	waitForReadyPod(t, ctx, client, namespace, selectedReader, targetNode)
+	for index, claim := range selectedClaims {
+		path := "/data-" + strconv.Itoa(index) + "/payload"
+		if digest := fileDigest(
+			t, ctx, config, client, namespace, selectedReader, "reader", path,
+		); digest != sourceDigests[claim] {
+			t.Fatalf("migrated %s digest=%s want=%s", claim, digest, sourceDigests[claim])
+		}
+	}
+	deletePod(t, ctx, client, namespace, selectedReader)
+	assertPVCDataOnNode(
+		t, ctx, config, client, namespace, "cache", "cache-after-migration",
+		sourceNode, sourceDigests["cache"],
+	)
+
+	runCLI(
+		t,
+		ctx,
+		binary,
+		append(
+			append([]string{}, common...),
+			[]string{"--yes", "migrate", "rollback", sessionID, "--dry-run=false"}...,
+		)...,
+	)
+	assertSessionPhase(
+		t, ctx, config, client, mode, "migrations", namespace, sessionID, "RolledBack",
+	)
+	for _, claim := range selectedClaims {
+		assertPVCIdentity(t, ctx, client, namespace, claim, "", sourcePVs[claim])
+	}
+	assertPVCIdentity(t, ctx, client, namespace, "cache", sourceUIDs["cache"], sourcePVs["cache"])
+
+	rollbackReader := "rollback-reader"
+	createPVCReader(t, ctx, client, namespace, rollbackReader, sourceNode, selectedClaims)
+	waitForReadyPod(t, ctx, client, namespace, rollbackReader, sourceNode)
+	for index, claim := range selectedClaims {
+		path := "/data-" + strconv.Itoa(index) + "/payload"
+		if digest := fileDigest(
+			t, ctx, config, client, namespace, rollbackReader, "reader", path,
+		); digest != sourceDigests[claim] {
+			t.Fatalf("rolled-back %s digest=%s want=%s", claim, digest, sourceDigests[claim])
+		}
+	}
+	deletePod(t, ctx, client, namespace, rollbackReader)
+
+	runCLI(
+		t,
+		ctx,
+		binary,
+		append(
+			append([]string{}, common...),
+			[]string{
+				"--yes", "migrate", "cleanup", sessionID,
+				"--destination-pvc-reclaim-policy", "Delete",
+				"--finalize", "--delete-session", "--dry-run=false",
+			}...,
+		)...,
+	)
+	assertSessionRecordNotFound(
+		t, ctx, config, client, mode, "migrations", namespace, sessionID,
+	)
+	assertPVCIdentity(t, ctx, client, namespace, "cache", sourceUIDs["cache"], sourcePVs["cache"])
+	assertPVCDataOnNode(
+		t, ctx, config, client, namespace, "cache", "cache-after-cleanup",
+		sourceNode, sourceDigests["cache"],
 	)
 }
 
@@ -3257,7 +3528,6 @@ func TestHelmManagedStatefulSetMigrationAndRollback(t *testing.T) {
 	if statefulSet.Spec.Replicas == nil || *statefulSet.Spec.Replicas != replicas {
 		t.Fatalf("StatefulSet replicas=%v want=%d", statefulSet.Spec.Replicas, replicas)
 	}
-	setRollbackPVsToDelete(t, ctx, client, sessionID)
 	runCLI(
 		t,
 		ctx,
@@ -3268,7 +3538,8 @@ func TestHelmManagedStatefulSetMigrationAndRollback(t *testing.T) {
 			"migrate-pod",
 			"cleanup",
 			sessionID,
-			"--delete-rollback-pv",
+			"--destination-pvc-reclaim-policy",
+			"Delete",
 			"--finalize",
 			"--delete-session",
 			"--dry-run=false",
@@ -3628,7 +3899,8 @@ func TestOnlineCopyMultiVolumeIdempotencyAndCleanup(t *testing.T) {
 			"copy",
 			"cleanup",
 			sessionID,
-			"--delete-temporary",
+			"--destination-pvc-reclaim-policy",
+			"Delete",
 			"--dry-run=false",
 		)...,
 	); !strings.Contains(
@@ -3675,7 +3947,8 @@ func TestOnlineCopyMultiVolumeIdempotencyAndCleanup(t *testing.T) {
 			"copy",
 			"cleanup",
 			sessionID,
-			"--delete-temporary",
+			"--destination-pvc-reclaim-policy",
+			"Delete",
 			"--dry-run=false",
 		)...,
 	); !strings.Contains(
@@ -3695,8 +3968,8 @@ func TestOnlineCopyMultiVolumeIdempotencyAndCleanup(t *testing.T) {
 			"copy",
 			"cleanup",
 			sessionID,
-			"--delete-temporary",
-			"--delete-rollback-pv",
+			"--destination-pvc-reclaim-policy",
+			"Delete",
 			"--finalize",
 			"--delete-session",
 			"--dry-run=false",
@@ -4012,6 +4285,8 @@ type copySessionVolume struct {
 	} `json:"destinationPV"`
 	DestinationReclaimPolicy string   `json:"destinationReclaimPolicy"`
 	SourceCapacity           string   `json:"sourceCapacity"`
+	SourceUsedBytes          int64    `json:"sourceUsedBytes"`
+	SourceUsageKnown         bool     `json:"sourceUsageKnown"`
 	Capacity                 string   `json:"capacity"`
 	StorageClass             string   `json:"storageClass"`
 	AccessModes              []string `json:"accessModes"`
@@ -4038,7 +4313,10 @@ type copySessionSnapshot struct {
 		ObservedGeneration int64  `json:"observedGeneration"`
 		StartedAt          string `json:"startedAt"`
 		UpdatedAt          string `json:"updatedAt"`
-		Volumes            []struct {
+		Plan               *struct {
+			Volumes []copySessionVolume `json:"volumes"`
+		} `json:"plan"`
+		Volumes []struct {
 			DestinationPVC struct {
 				Namespace string `json:"namespace"`
 				Name      string `json:"name"`
@@ -4115,6 +4393,12 @@ func readCopySession(
 		}
 		if err := json.Unmarshal(statusJSON, &snapshot.Status); err != nil {
 			t.Fatal(err)
+		}
+		if snapshot.Status.Plan != nil {
+			snapshot.Spec.Volumes = append(
+				[]copySessionVolume(nil),
+				snapshot.Status.Plan.Volumes...,
+			)
 		}
 		// Namespaced workflow specs intentionally use local references. Rebuild
 		// the execution-model namespace in this test snapshot so the
@@ -5070,6 +5354,17 @@ func readerDigest(
 	namespace, pod string,
 ) string {
 	t.Helper()
+	return fileDigest(t, ctx, config, client, namespace, pod, "reader", "/data-0/payload")
+}
+
+func fileDigest(
+	t *testing.T,
+	ctx context.Context,
+	config *rest.Config,
+	client kubernetes.Interface,
+	namespace, pod, container, path string,
+) string {
+	t.Helper()
 	output := execOutput(
 		t,
 		ctx,
@@ -5077,14 +5372,98 @@ func readerDigest(
 		client,
 		namespace,
 		pod,
-		"reader",
-		[]string{"sha256sum", "/data-0/payload"},
+		container,
+		[]string{"sha256sum", path},
 	)
 	fields := strings.Fields(output)
 	if len(fields) == 0 {
-		t.Fatalf("empty reader sha256sum output: %q", output)
+		t.Fatalf("empty sha256sum output for %s: %q", path, output)
 	}
 	return fields[0]
+}
+
+func assertPVCIdentity(
+	t *testing.T,
+	ctx context.Context,
+	client kubernetes.Interface,
+	namespace, name string,
+	uid types.UID,
+	volumeName string,
+) {
+	t.Helper()
+	pvc, err := client.CoreV1().PersistentVolumeClaims(namespace).
+		Get(ctx, name, metav1.GetOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if uid != "" && pvc.UID != uid {
+		t.Fatalf("PVC %s/%s UID=%s want=%s", namespace, name, pvc.UID, uid)
+	}
+	if pvc.Status.Phase != corev1.ClaimBound || pvc.Spec.VolumeName != volumeName {
+		t.Fatalf(
+			"PVC %s/%s phase=%s volume=%s want Bound/%s",
+			namespace,
+			name,
+			pvc.Status.Phase,
+			pvc.Spec.VolumeName,
+			volumeName,
+		)
+	}
+}
+
+func assertPVCDataOnNode(
+	t *testing.T,
+	ctx context.Context,
+	config *rest.Config,
+	client kubernetes.Interface,
+	namespace, claim, podName, node, wantDigest string,
+) {
+	t.Helper()
+	createPVCReader(t, ctx, client, namespace, podName, node, []string{claim})
+	waitForReadyPod(t, ctx, client, namespace, podName, node)
+	if digest := readerDigest(t, ctx, config, client, namespace, podName); digest != wantDigest {
+		t.Fatalf("PVC %s digest=%s want=%s", claim, digest, wantDigest)
+	}
+	deletePod(t, ctx, client, namespace, podName)
+}
+
+func assertControllerMigrationPlanPVCs(
+	t *testing.T,
+	ctx context.Context,
+	config *rest.Config,
+	mode, namespace, id string,
+	want []string,
+) {
+	t.Helper()
+	if mode != "controller" {
+		return
+	}
+
+	object := readWorkflowObject(t, ctx, config, "migrations", namespace, id)
+	volumes, found, err := unstructured.NestedSlice(object.Object, "status", "plan", "volumes")
+	if err != nil || !found {
+		t.Fatalf("read Migration status.plan.volumes: found=%t error=%v", found, err)
+	}
+	if len(volumes) != len(want) {
+		t.Fatalf("Migration status.plan volumes=%d want=%d", len(volumes), len(want))
+	}
+	for index, expected := range want {
+		volume, ok := volumes[index].(map[string]any)
+		if !ok {
+			t.Fatalf("Migration status.plan volume %d has type %T", index, volumes[index])
+		}
+		name, found, err := unstructured.NestedString(volume, "sourcePVC", "name")
+		if err != nil || !found || name != expected {
+			t.Fatalf(
+				"Migration status.plan volume %d sourcePVC=%q found=%t error=%v want=%q",
+				index,
+				name,
+				found,
+				err,
+				expected,
+			)
+		}
+	}
 }
 
 func execOutput(
@@ -5456,43 +5835,6 @@ func assertOfflineSessionPayloadShape(
 	for _, forbidden := range []string{"workload", "precopyPasses", "openebsLvmEnableShared"} {
 		if bytes.Contains(payload, []byte(forbidden)) {
 			t.Fatalf("real-time field %q leaked into offline payload: %s", forbidden, payload)
-		}
-	}
-}
-
-func setRollbackPVsToDelete(
-	t *testing.T,
-	ctx context.Context,
-	client kubernetes.Interface,
-	sessionID string,
-) {
-	t.Helper()
-	selector := labels.Set{sessionLabel: sessionID, roleLabel: "rollback"}.String()
-	volumes, err := client.CoreV1().
-		PersistentVolumes().
-		List(ctx, metav1.ListOptions{LabelSelector: selector})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(volumes.Items) == 0 {
-		t.Fatal("session has no rollback PV")
-	}
-	for i := range volumes.Items {
-		name := volumes.Items[i].Name
-		if err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
-			volume, getErr := client.CoreV1().
-				PersistentVolumes().
-				Get(ctx, name, metav1.GetOptions{})
-			if getErr != nil {
-				return getErr
-			}
-			volume.Spec.PersistentVolumeReclaimPolicy = corev1.PersistentVolumeReclaimDelete
-			_, updateErr := client.CoreV1().
-				PersistentVolumes().
-				Update(ctx, volume, metav1.UpdateOptions{})
-			return updateErr
-		}); err != nil {
-			t.Fatal(err)
 		}
 	}
 }

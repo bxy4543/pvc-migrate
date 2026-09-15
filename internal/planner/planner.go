@@ -65,6 +65,7 @@ type Planner struct {
 	controllers                   *controller.Manager
 	openEBSLVMSharedVolumeManager kube.OpenEBSLVMSharedVolumeManager
 	volumeUsageReader             kube.VolumeUsageReader
+	hostPathUsageReader           kube.FilesystemUsageReader
 	logger                        *slog.Logger
 	controllerSubmission          bool
 	planningWorkflow              bool
@@ -134,6 +135,11 @@ func (p *Planner) WithOpenEBSLVMSharedVolumeManager(
 
 func (p *Planner) WithVolumeUsageReader(reader kube.VolumeUsageReader) *Planner {
 	p.volumeUsageReader = reader
+	return p
+}
+
+func (p *Planner) WithHostPathUsageReader(reader kube.FilesystemUsageReader) *Planner {
+	p.hostPathUsageReader = reader
 	return p
 }
 
@@ -703,6 +709,7 @@ type planVolumeInput struct {
 	capacity          resource.Quantity
 	sourceClass       string
 	sourceProvisioner string
+	hostPath          bool
 }
 
 func (p *Planner) planVolumes(ctx context.Context, state *planState) {
@@ -718,6 +725,7 @@ func (p *Planner) planVolumes(ctx context.Context, state *planState) {
 			index,
 			input,
 		)
+
 		p.updatePlanStorageTotals(state, input, destinationCapacity)
 
 		storageClass, bindingMode, ok := p.resolvePlanStorageClass(
@@ -1160,13 +1168,16 @@ func (p *Planner) loadPlanVolumeInput(
 	}
 
 	sourceProvisioner := ""
+	hostPath := kube.IsHostPathPersistentVolume(pv)
 	if sourceStorageClass := state.storageClasses[sourceClass]; sourceStorageClass != nil {
 		sourceProvisioner = sourceStorageClass.Provisioner
+		hostPath = hostPath || sourceStorageClass.Provisioner == kube.OpenEBSLocalPVProvisioner &&
+			strings.EqualFold(openEBSLocalStorageType(sourceStorageClass), "hostpath")
 	}
 
 	return planVolumeInput{
 		pvc: pvc, pv: pv, mode: mode, capacity: capacity,
-		sourceClass: sourceClass, sourceProvisioner: sourceProvisioner,
+		sourceClass: sourceClass, sourceProvisioner: sourceProvisioner, hostPath: hostPath,
 	}, true
 }
 
@@ -1183,6 +1194,60 @@ func (p *Planner) planVolumeCapacity(
 		sourceUsed int64
 		usageKnown bool
 	)
+	if index < len(state.requestedCapacities) && state.requestedCapacities[index] != "" {
+		parsed, err := resource.ParseQuantity(state.requestedCapacities[index])
+		if err == nil && parsed.Sign() > 0 {
+			destinationCapacity = parsed
+		}
+	}
+
+	if input.hostPath && p.hostPathUsageReader == nil {
+		state.plan.AddCheck(failed(
+			domain.CheckNameSourceUsage,
+			fmt.Sprintf(
+				"PVC %s/%s uses HostPath storage but no filesystem usage reader is configured",
+				input.pvc.Namespace,
+				input.pvc.Name,
+			),
+		))
+		return destinationCapacity, sourceUsed, usageKnown
+	}
+	if input.hostPath {
+		usage, err := p.hostPathUsageReader.Read(ctx, kube.VolumeUsageReadOptions{
+			OperationID: state.options.SessionID,
+			SourcePVC:   kube.PVCReference(input.pvc),
+			SourcePV:    kube.PVReference(input.pv),
+		})
+		if err != nil {
+			state.plan.AddCheck(failed(
+				domain.CheckNameSourceUsage,
+				fmt.Sprintf("PVC %s/%s HostPath usage could not be measured: %v", input.pvc.Namespace, input.pvc.Name, err),
+			))
+			return destinationCapacity, sourceUsed, usageKnown
+		}
+		if usage.UsedBytes < 0 {
+			state.plan.AddCheck(failed(
+				domain.CheckNameSourceUsage,
+				fmt.Sprintf("PVC %s/%s HostPath usage returned invalid bytes %d", input.pvc.Namespace, input.pvc.Name, usage.UsedBytes),
+			))
+			return destinationCapacity, sourceUsed, usageKnown
+		}
+		sourceUsed, usageKnown = usage.UsedBytes, true
+		safeCapacity := kube.HostPathDestinationCapacity(input.capacity, sourceUsed)
+		if index >= len(state.requestedCapacities) || state.requestedCapacities[index] == "" {
+			destinationCapacity = safeCapacity
+			state.plan.AddCheck(passed(domain.CheckNameDestinationCapacity, fmt.Sprintf(
+				"PVC %s/%s HostPath usage is %d bytes; destination capacity automatically set to %s with 20%% headroom",
+				input.pvc.Namespace, input.pvc.Name, sourceUsed, destinationCapacity.String(),
+			)))
+		} else if destinationCapacity.Cmp(safeCapacity) < 0 {
+			state.plan.AddCheck(failed(domain.CheckNameDestinationCapacity, fmt.Sprintf(
+				"PVC %s/%s requested destination capacity %s is below HostPath safety minimum %s for %d used bytes (20%% headroom)",
+				input.pvc.Namespace, input.pvc.Name, destinationCapacity.String(), safeCapacity.String(), sourceUsed,
+			)))
+		}
+	}
+
 	if index >= len(state.requestedCapacities) || state.requestedCapacities[index] == "" {
 		return destinationCapacity, sourceUsed, usageKnown
 	}

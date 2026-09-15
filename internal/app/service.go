@@ -36,6 +36,7 @@ type Config struct {
 	// arbitrary image, and upgrades can continue existing sessions safely.
 	TrustedToolImage              string
 	VolumeUsageReader             kube.VolumeUsageReader
+	HostPathUsageReader           kube.FilesystemUsageReader
 	OpenEBSLVMSharedVolumeManager kube.OpenEBSLVMSharedVolumeManager
 	SessionRecords                *kube.SessionRecords
 }

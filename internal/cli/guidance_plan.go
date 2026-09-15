@@ -17,9 +17,9 @@ func printPlanResult(
 		return reportPlanningError(cmd, err)
 	}
 
-	message := "\nPlanning completed without cluster mutations. Resolve the failed checks, then rerun the command."
+	message := "\nPlanning completed without persistent workflow or data-plane mutations. Resolve the failed checks, then rerun the command. HostPath planning may run and remove a read-only usage probe Pod."
 	if plan.Ready {
-		message = "\nDry-run completed without cluster mutations. Run the write command with the same inputs and --dry-run=false; provide --yes or typed approval when requested."
+		message = "\nDry-run completed without persistent workflow or data-plane mutations. HostPath planning may run and remove a read-only usage probe Pod. Run the write command with the same inputs and --dry-run=false; provide --yes or typed approval when requested."
 	}
 
 	if _, err := fmt.Fprintln(cmd.ErrOrStderr(), message); err != nil {

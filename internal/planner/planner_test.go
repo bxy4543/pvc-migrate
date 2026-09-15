@@ -969,6 +969,87 @@ func TestOfflineMigrationPlansMultiplePVCsInOneSession(t *testing.T) {
 	}
 }
 
+func TestOfflineMigrationPlansOnlySelectedPVCs(t *testing.T) {
+	objects := plannerObjectsWithTwoPVCs(t)
+	dataPVC := testutil.MustType[*corev1.PersistentVolumeClaim](t, objects[5])
+	dataPV := testutil.MustType[*corev1.PersistentVolume](t, objects[6])
+
+	cachePVC := dataPVC.DeepCopy()
+	cachePVC.Name = "cache"
+	cachePVC.UID = types.UID("cache-pvc-uid")
+	cachePVC.Spec.VolumeName = "pv-cache"
+	cachePV := dataPV.DeepCopy()
+	cachePV.Name = "pv-cache"
+	cachePV.UID = types.UID("cache-pv-uid")
+	cachePV.Spec.ClaimRef = &corev1.ObjectReference{
+		Namespace: "app",
+		Name:      cachePVC.Name,
+		UID:       cachePVC.UID,
+	}
+	objects = append(objects, cachePVC, cachePV)
+
+	client := plannerClient(objects...)
+	plan, err := New(client, nil).PlanOfflineMigration(
+		context.Background(),
+		OfflineMigrationOptions{
+			SessionID:             "selected-pvc-offline",
+			SourceNamespace:       "app",
+			TemporaryNamespace:    "system",
+			DestinationNamespace:  "app",
+			StagingNamespace:      "system",
+			SessionNamespace:      "system",
+			SourcePVCs:            []string{"logs", "data"},
+			DestinationPVCs:       []string{"logs=logs-migrated", "data=data-migrated"},
+			DestinationCapacities: []string{"logs=3Gi", "data=2Gi"},
+			TargetNode:            "node-b",
+			DestinationClass:      "fast",
+			Strategies:            []string{"clusterip"},
+		},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if !plan.Ready {
+		t.Fatalf("selected PVC plan failed checks: %#v", plan.Checks)
+	}
+	if len(plan.SessionSpec.Volumes) != 2 {
+		t.Fatalf("planned %d volumes, want 2", len(plan.SessionSpec.Volumes))
+	}
+
+	want := []struct {
+		source, destination, capacity string
+		pvcUID, pvUID                 types.UID
+	}{
+		{source: "logs", destination: "logs-migrated", capacity: "3Gi", pvcUID: "logs-pvc-uid", pvUID: "logs-pv-uid"},
+		{source: "data", destination: "data-migrated", capacity: "2Gi", pvcUID: "pvc-uid", pvUID: "pv-uid"},
+	}
+	for index, expected := range want {
+		volume := plan.SessionSpec.Volumes[index]
+		if volume.SourcePVC.Name != expected.source ||
+			volume.SourcePVC.UID != expected.pvcUID ||
+			volume.SourcePV.UID != expected.pvUID ||
+			volume.DestinationPVC.Name != expected.destination ||
+			volume.Capacity != expected.capacity {
+			t.Fatalf("volume %d=%+v, want %+v", index, volume, expected)
+		}
+	}
+
+	for _, volume := range plan.SessionSpec.Volumes {
+		if volume.SourcePVC.Name == cachePVC.Name || volume.SourcePV.Name == cachePV.Name {
+			t.Fatalf("unselected PVC entered plan: %+v", volume)
+		}
+	}
+	for _, action := range client.Actions() {
+		if action.GetVerb() == "get" && action.GetResource().Resource == "persistentvolumeclaims" {
+			get, ok := action.(clienttesting.GetAction)
+			if ok && get.GetName() == cachePVC.Name {
+				t.Fatalf("planner read unselected PVC: %v", action)
+			}
+		}
+	}
+}
+
 func TestPlanReportsMissingSelectedPodWithFlagGuidance(t *testing.T) {
 	plan, err := New(
 		plannerClient(plannerObjects("2Gi")...),

@@ -2,6 +2,7 @@ package app
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"strings"
 
@@ -22,9 +23,33 @@ func (s *Service) verifyShrinkUsage(ctx context.Context, session *domain.Session
 	options := session.Spec.WorkflowOptions()
 	for _, volume := range session.Spec.Volumes {
 		source, sourceErr := resource.ParseQuantity(volume.SourceCapacity)
-
 		destination, destinationErr := resource.ParseQuantity(volume.Capacity)
-		if sourceErr != nil || destinationErr != nil || destination.Cmp(source) >= 0 {
+		if sourceErr != nil || destinationErr != nil {
+			continue
+		}
+
+		if s.config.HostPathUsageReader != nil {
+			usage, usageErr := s.config.HostPathUsageReader.Read(ctx, kube.VolumeUsageReadOptions{
+				OperationID: session.ID,
+				SourcePVC:   volume.SourcePVC,
+				SourcePV:    volume.SourcePV,
+			})
+			if usageErr == nil {
+				if usage.UsedBytes < 0 {
+					return domain.NewError(domain.ErrorPrecondition, domain.ErrorOperationSourceUsageCheck, fmt.Sprintf("PVC %s/%s HostPath usage returned invalid bytes %d", volume.SourcePVC.Namespace, volume.SourcePVC.Name, usage.UsedBytes))
+				}
+				safe := kube.HostPathDestinationCapacity(source, usage.UsedBytes)
+				if destination.Cmp(safe) < 0 {
+					return domain.NewError(domain.ErrorConflict, domain.ErrorOperationSourceUsageCheck, fmt.Sprintf("PVC %s/%s uses %d bytes; destination capacity %s is below HostPath safety minimum %s", volume.SourcePVC.Namespace, volume.SourcePVC.Name, usage.UsedBytes, destination.String(), safe.String()))
+				}
+				continue
+			}
+			if !errors.Is(usageErr, kube.ErrVolumeUsageUnsupported) {
+				return domain.WrapError(domain.ErrorPrecondition, domain.ErrorOperationSourceUsageCheck, "HostPath usage could not be rechecked", usageErr)
+			}
+		}
+
+		if destination.Cmp(source) >= 0 {
 			continue
 		}
 
@@ -38,7 +63,6 @@ func (s *Service) verifyShrinkUsage(ctx context.Context, session *domain.Session
 				"destinationCapacity",
 				destination.String(),
 			)
-
 			continue
 		}
 
@@ -91,34 +115,22 @@ func (s *Service) verifyShrinkUsage(ctx context.Context, session *domain.Session
 		}
 
 		if usage.UsedBytes > destination.Value() {
-			if sourcePath := domain.SourceTransferPath(
-				volume.TransferScope,
-			); sourcePath != domain.VolumeRootPath {
+			if sourcePath := domain.SourceTransferPath(volume.TransferScope); sourcePath != domain.VolumeRootPath {
 				return domain.NewError(
 					domain.ErrorConflict,
 					domain.ErrorOperationSourceUsageCheck,
 					fmt.Sprintf(
 						"PVC %s/%s whole-volume usage is %d bytes according to %s, above destination capacity %s; this cannot prove that selected source directory %q fits; abort this session and create a new one with a larger destination, or use --skip-source-usage-check only after independently measuring the selected data",
-						volume.SourcePVC.Namespace,
-						volume.SourcePVC.Name,
-						usage.UsedBytes,
-						usageSource,
-						destination.String(),
-						sourcePath,
+						volume.SourcePVC.Namespace, volume.SourcePVC.Name, usage.UsedBytes, usageSource, destination.String(), sourcePath,
 					),
 				)
 			}
-
 			return domain.NewError(
 				domain.ErrorConflict,
 				domain.ErrorOperationSourceUsageCheck,
 				fmt.Sprintf(
 					"PVC %s/%s uses %d bytes according to %s, above destination capacity %s; increase --destination-capacity or abort this shrink",
-					volume.SourcePVC.Namespace,
-					volume.SourcePVC.Name,
-					usage.UsedBytes,
-					usageSource,
-					destination.String(),
+					volume.SourcePVC.Namespace, volume.SourcePVC.Name, usage.UsedBytes, usageSource, destination.String(),
 				),
 			)
 		}
