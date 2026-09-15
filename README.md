@@ -49,9 +49,10 @@ version. No image overrides are required. The chart installs workflow CRDs
 and defaults to two controller replicas with leader election, restricted security
 contexts, health probes, resource requests/limits, and a disruption budget.
 It never creates namespaces. For Helm 3.17+, use `--atomic` instead of
-`--rollback-on-failure`. See [chart operations](charts/pvc-migrate/README.md)
-for source-chart installation, values, CRD upgrades, adoption of existing
-manifests, and rollback.
+`--rollback-on-failure`. See the [中文 Operator 使用指南](docs/operator-guide.zh-CN.md)
+for declarative PVC migration examples and lifecycle operations. See
+[chart operations](charts/pvc-migrate/README.md) for source-chart installation,
+values, CRD upgrades, adoption of existing manifests, and rollback.
 
 Each workflow kind has separate execution, recovery, and deletion queues.
 After leader replacement, interrupted workload pauses and storage cutovers can

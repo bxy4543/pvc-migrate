@@ -7,6 +7,10 @@ workflow namespaces, and leader election uses a fixed Lease name in the
 release namespace. Installing another controller in a different namespace
 does not provide independent tenancy.
 
+For declarative `Migration` examples, HostPath capacity behavior, status
+observation, rollback, and cleanup, see the
+[中文 Operator 使用指南](../../docs/operator-guide.zh-CN.md).
+
 ## Install
 
 The release namespace and every workflow namespace must already exist.
